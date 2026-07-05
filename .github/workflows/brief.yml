@@ -1,0 +1,99 @@
+name: stock-brief
+
+on:
+  schedule:
+    - cron: "30 22 * * 0-4"   # JST 平日 7:30 (UTC 22:30 日〜木)
+  workflow_dispatch:
+    inputs:
+      code:
+        description: "銘柄コード4桁(空ならwatchlist.txt全銘柄)"
+        required: false
+      sector:
+        description: "東証33業種名(例: 機械, 電気機器, 化学。任意)"
+        required: false
+  issues:
+    types: [opened]           # タイトル「分析 7203 輸送用機器」形式のIssueで起動
+  repository_dispatch:
+    types: [brief]            # API経由: client_payload.code / .sector
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    # Issueイベントの場合はタイトルが「分析」で始まるものだけ処理
+    if: github.event_name != 'issues' || startsWith(github.event.issue.title, '分析')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet -r requirements.txt
+
+      - name: Resolve inputs
+        id: params
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          CODE=""; SECTOR=""
+          case "${{ github.event_name }}" in
+            issues)
+              # タイトル例: 「分析 7203 輸送用機器」/「分析 6492」
+              CODE=$(echo "$ISSUE_TITLE" | grep -oE '[0-9]{4}' | head -1)
+              SECTOR=$(echo "$ISSUE_TITLE" | sed -E 's/^分析//; s/[0-9]{4}//; s/[[:space:]　]+//g')
+              ;;
+            workflow_dispatch)
+              CODE="${{ inputs.code }}"; SECTOR="${{ inputs.sector }}" ;;
+            repository_dispatch)
+              CODE="${{ github.event.client_payload.code }}"
+              SECTOR="${{ github.event.client_payload.sector }}" ;;
+          esac
+          echo "code=$CODE"     >> "$GITHUB_OUTPUT"
+          echo "sector=$SECTOR" >> "$GITHUB_OUTPUT"
+          echo "対象: code=[$CODE] sector=[$SECTOR] (空ならwatchlist全銘柄)"
+
+      - name: Generate briefs
+        env:
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+          INPUT_CODE: ${{ steps.params.outputs.code }}
+          INPUT_SECTOR: ${{ steps.params.outputs.sector }}
+        run: python brief.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/brief
+          git commit -m "brief: update $(date -u +%FT%TZ) [skip ci]" || echo "no changes"
+          git pull --rebase origin ${GITHUB_REF_NAME} || true
+          git push
+
+      - name: Reply to issue with brief
+        if: github.event_name == 'issues' && steps.params.outputs.code != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CODE: ${{ steps.params.outputs.code }}
+        run: |
+          if [ -f "docs/brief/${CODE}.md" ]; then
+            gh issue comment ${{ github.event.issue.number }} --body-file "docs/brief/${CODE}.md"
+            gh issue close ${{ github.event.issue.number }} --comment "ブリーフ生成完了。上のコメントを読んで判断してください。"
+          else
+            gh issue comment ${{ github.event.issue.number }} --body "ブリーフ生成に失敗しました。Actionsのログを確認してください。"
+          fi
+
+      - name: Reply to issue on failure
+        if: failure() && github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue comment ${{ github.event.issue.number }} --body "処理が失敗しました。Actionsログを確認してください。" || true
